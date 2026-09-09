@@ -42,14 +42,12 @@ export async function readBounded(
 }
 
 /**
- * One read-only remote script per refresh. Container calls prefer
- * `sudo -n docker` (operator accounts deliberately outside the docker
- * group), then plain `docker`, then the same pair for `podman` (rootless
- * and rootful). A host with none of those simply yields empty container
- * sections. `inspect` uses a narrow format string on purpose —
- * full inspect JSON would leak container environment variables (secrets)
- * into the snapshot. Section names stay `DOCKER_*` so existing parsers
- * and the snapshot cache keep working.
+ * One read-only remote script per refresh. Docker and Podman are probed
+ * independently so a host running both engines reports both sets. If the
+ * docker CLI is actually talking to Podman, the docker pass is dropped to
+ * avoid listing the same containers twice. KVM/libvirt domains come from
+ * `virsh` on qemu:///system and qemu:///session. `inspect` / `dominfo` stay
+ * narrow so environment variables and domain XML never leave the host.
  */
 export const REMOTE_SCRIPT = `
 set -o pipefail
@@ -64,20 +62,46 @@ echo "@@DISK@@"
 df -B1 --output=source,fstype,target,size,used,avail -x tmpfs -x devtmpfs -x overlay -x squashfs -x iso9660 2>/dev/null | tail -n +2
 echo "@@NET@@"
 tail -n +3 /proc/net/dev
-if sudo -n docker version >/dev/null 2>&1; then CTR="sudo -n docker"
-elif docker version >/dev/null 2>&1; then CTR="docker"
-elif sudo -n podman version >/dev/null 2>&1; then CTR="sudo -n podman"
-elif podman version >/dev/null 2>&1; then CTR="podman"
-else CTR=""; fi
-echo "@@DOCKER_PS@@"
-[ -n "$CTR" ] && $CTR ps --all --format "{{json .}}" 2>/dev/null || true
-echo "@@DOCKER_STATS@@"
-[ -n "$CTR" ] && $CTR stats --no-stream --format "{{json .}}" 2>/dev/null || true
-echo "@@DOCKER_INSPECT@@"
-ids=$([ -n "$CTR" ] && $CTR ps -aq 2>/dev/null || true)
-if [ -n "$ids" ]; then
-  $CTR inspect --format '{"Name":{{json .Name}},"Restarts":{{.RestartCount}},"StartedAt":{{json .State.StartedAt}},"Status":{{json .State.Status}},"OOM":{{.State.OOMKilled}},"Health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}}' $ids 2>/dev/null || true
+dump_engine() {
+  bin="$1"
+  prefix="$2"
+  echo "@@"\${prefix}"_PS@@"
+  [ -n "$bin" ] && $bin ps --all --format "{{json .}}" 2>/dev/null || true
+  echo "@@"\${prefix}"_STATS@@"
+  [ -n "$bin" ] && $bin stats --no-stream --format "{{json .}}" 2>/dev/null || true
+  echo "@@"\${prefix}"_INSPECT@@"
+  ids=$([ -n "$bin" ] && $bin ps -aq 2>/dev/null || true)
+  if [ -n "$ids" ]; then
+    $bin inspect --format '{"Name":{{json .Name}},"Restarts":{{.RestartCount}},"StartedAt":{{json .State.StartedAt}},"Status":{{json .State.Status}},"OOM":{{.State.OOMKilled}},"Health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}}' $ids 2>/dev/null || true
+  fi
+}
+if sudo -n docker version >/dev/null 2>&1; then DOCKER="sudo -n docker"
+elif docker version >/dev/null 2>&1; then DOCKER="docker"
+else DOCKER=""; fi
+if sudo -n podman version >/dev/null 2>&1; then PODMAN="sudo -n podman"
+elif podman version >/dev/null 2>&1; then PODMAN="podman"
+else PODMAN=""; fi
+if [ -n "$DOCKER" ] && $DOCKER info 2>/dev/null | grep -qi podman; then
+  [ -n "$PODMAN" ] || PODMAN="$DOCKER"
+  DOCKER=""
 fi
+dump_engine "$DOCKER" DOCKER
+dump_engine "$PODMAN" PODMAN
+dump_kvm_uri() {
+  uri="$1"
+  bin=""
+  if sudo -n virsh -c "$uri" domstats --state >/dev/null 2>&1; then bin="sudo -n virsh"
+  elif virsh -c "$uri" domstats --state >/dev/null 2>&1; then bin="virsh"
+  fi
+  [ -n "$bin" ] || return 1
+  stats=$($bin -c "$uri" domstats --state --balloon --vcpu 2>/dev/null)
+  [ -n "$stats" ] || return 1
+  echo "URI: $uri"
+  printf '%s\n' "$stats"
+  return 0
+}
+echo "@@KVM@@"
+dump_kvm_uri qemu:///system || dump_kvm_uri qemu:///session || true
 echo "@@END@@"
 `;
 
@@ -410,17 +434,21 @@ interface InspectRow {
   Health?: string;
 }
 
-export function parseContainers(sections: Map<string, string[]>): ContainerMetrics[] {
-  const ps = parseJsonLines<PsRow>(sections.get("DOCKER_PS") || []);
-  const stats = parseJsonLines<StatsRow>(sections.get("DOCKER_STATS") || []);
-  const inspect = parseJsonLines<InspectRow>(sections.get("DOCKER_INSPECT") || []);
+function parseEngine(
+  sections: Map<string, string[]>,
+  prefix: string,
+  runtime: "docker" | "podman",
+): ContainerMetrics[] {
+  const ps = parseJsonLines<PsRow>(sections.get(`${prefix}_PS`) || []);
+  const stats = parseJsonLines<StatsRow>(sections.get(`${prefix}_STATS`) || []);
+  const inspect = parseJsonLines<InspectRow>(sections.get(`${prefix}_INSPECT`) || []);
 
   const statsByName = new Map(stats.map((row) => [String(row.Name || ""), row]));
   const inspectByName = new Map(
     inspect.map((row) => [String(row.Name || "").replace(/^\//, ""), row]),
   );
 
-  return ps.slice(0, MAX_CONTAINERS).map((row) => {
+  return ps.map((row) => {
     const name = psName(row);
     const stat = statsByName.get(name);
     const info = inspectByName.get(name);
@@ -428,6 +456,7 @@ export function parseContainers(sections: Map<string, string[]>): ContainerMetri
 
     return {
       name,
+      runtime,
       image: String(row.Image || ""),
       status: String(row.Status || row.State || ""),
       state: String(info?.Status || row.State || ""),
@@ -444,6 +473,180 @@ export function parseContainers(sections: Map<string, string[]>): ContainerMetri
       pids: stat?.PIDs != null && stat.PIDs !== "" ? Number(stat.PIDs) : null,
     };
   });
+}
+
+interface KvmRow {
+  Name?: string;
+  State?: string;
+  Cpus?: number | string;
+  MaxMemKib?: number | string;
+  UsedMemKib?: number | string;
+  Uri?: string;
+}
+
+function kvmState(raw: string): string {
+  const state = raw.toLowerCase().replace(/\s+/g, " ").trim();
+  if (state === "1" || state === "running") return "running";
+  if (state === "2" || state === "blocked") return "running";
+  if (state === "3" || state === "paused" || state === "7" || state === "pmsuspended") return "paused";
+  if (state === "4" || state === "shutdown" || state === "5" || state === "shut off" || state === "shutoff") return "exited";
+  if (state === "6" || state === "crashed" || state === "dying") return "dead";
+  return state || "unknown";
+}
+
+function kvmStatusDescription(rawState: string, normalizedState: string): string {
+  switch (rawState) {
+    case "1": return "running";
+    case "2": return "blocked";
+    case "3": return "paused";
+    case "4": return "shutdown";
+    case "5": return "shut off";
+    case "6": return "crashed";
+    case "7": return "pmsuspended";
+    default: return rawState || normalizedState;
+  }
+}
+
+function parseKvm(sections: Map<string, string[]>): ContainerMetrics[] {
+  const lines = sections.get("KVM") || [];
+  const seen = new Set<string>();
+  const rows: ContainerMetrics[] = [];
+
+  let currentUri = "";
+  let currentDomain: {
+    name: string;
+    state?: string;
+    cpus?: number;
+    usedKib?: number;
+    maxKib?: number;
+  } | null = null;
+
+  const flushDomain = () => {
+    if (!currentDomain || !currentDomain.name) return;
+    const name = currentDomain.name.trim();
+    if (!name) return;
+    const key = name.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+
+    const usedKib = currentDomain.usedKib ?? null;
+    const maxKib = currentDomain.maxKib ?? null;
+    const usage = usedKib !== null && Number.isFinite(usedKib) ? Math.round(usedKib * 1024) : null;
+    const limit = maxKib !== null && Number.isFinite(maxKib) ? Math.round(maxKib * 1024) : null;
+    const rawState = currentDomain.state || "";
+    const state = kvmState(rawState);
+    const status = kvmStatusDescription(rawState, state);
+
+    rows.push({
+      name,
+      runtime: "kvm",
+      image: currentUri ? `kvm ${currentUri}` : "kvm",
+      status,
+      state,
+      health: "none",
+      restarts: 0,
+      startedAt: "",
+      oomKilled: false,
+      cpuPercent: null,
+      memUsageBytes: usage,
+      memLimitBytes: limit,
+      memPercent:
+        usage !== null && limit !== null && limit > 0
+          ? Math.round((usage / limit) * 1000) / 10
+          : null,
+      netIo: "",
+      blockIo: "",
+      pids: null,
+    });
+  };
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    if (line.startsWith("{")) {
+      try {
+        const row = JSON.parse(line) as KvmRow;
+        const name = String(row.Name || "").trim();
+        if (!name) continue;
+        const key = name.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const usedKib = Number(row.UsedMemKib);
+        const maxKib = Number(row.MaxMemKib);
+        const usage = Number.isFinite(usedKib) ? Math.round(usedKib * 1024) : null;
+        const limit = Number.isFinite(maxKib) ? Math.round(maxKib * 1024) : null;
+        const uri = String(row.Uri || "");
+        const rawState = String(row.State || "");
+        const state = kvmState(rawState);
+        rows.push({
+          name,
+          runtime: "kvm",
+          image: uri ? `kvm ${uri}` : "kvm",
+          status: String(row.State || state),
+          state,
+          health: "none",
+          restarts: 0,
+          startedAt: "",
+          oomKilled: false,
+          cpuPercent: null,
+          memUsageBytes: usage,
+          memLimitBytes: limit,
+          memPercent:
+            usage !== null && limit !== null && limit > 0
+              ? Math.round((usage / limit) * 1000) / 10
+              : null,
+          netIo: "",
+          blockIo: "",
+          pids: null,
+        });
+      } catch {}
+      continue;
+    }
+
+    if (line.startsWith("URI:")) {
+      currentUri = line.slice("URI:".length).trim();
+      continue;
+    }
+
+    const domainMatch = line.match(/^Domain:\s*['"]?([^'"]+)['"]?$/);
+    if (domainMatch) {
+      flushDomain();
+      currentDomain = { name: domainMatch[1].trim() };
+      continue;
+    }
+
+    if (!currentDomain) continue;
+
+    const eqIdx = line.indexOf("=");
+    if (eqIdx < 0) continue;
+    const k = line.slice(0, eqIdx).trim();
+    const v = line.slice(eqIdx + 1).trim();
+
+    if (k === "state.state") {
+      currentDomain.state = v;
+    } else if (k === "balloon.current") {
+      const n = Number(v);
+      if (Number.isFinite(n)) currentDomain.usedKib = n;
+    } else if (k === "balloon.maximum") {
+      const n = Number(v);
+      if (Number.isFinite(n)) currentDomain.maxKib = n;
+    } else if (k === "vcpu.current") {
+      const n = Number(v);
+      if (Number.isFinite(n)) currentDomain.cpus = n;
+    }
+  }
+
+  flushDomain();
+  return rows;
+}
+
+export function parseContainers(sections: Map<string, string[]>): ContainerMetrics[] {
+  return [
+    ...parseEngine(sections, "DOCKER", "docker"),
+    ...parseEngine(sections, "PODMAN", "podman"),
+    ...parseKvm(sections),
+  ].slice(0, MAX_CONTAINERS);
 }
 
 export async function collectSnapshot(sshHost: string): Promise<ServerSnapshot> {
