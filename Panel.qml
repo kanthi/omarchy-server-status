@@ -16,7 +16,7 @@ Panel {
   // Kept in step with manifest.json by a test, rather than read from disk at
   // runtime: the panel should not gain a file read and a failure mode just to
   // print its own version.
-  readonly property string pluginVersion: "0.8.0"
+  readonly property string pluginVersion: "0.9.0"
   readonly property string pluginName: "Tailscale Host Monitor"
   readonly property string repoUrl: "https://github.com/nixfred/omarchy-server-status"
   readonly property string authorUrl: "https://nixfred.com"
