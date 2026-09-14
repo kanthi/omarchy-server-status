@@ -655,3 +655,43 @@ describe("theme status palette", () => {
     }
   });
 });
+
+describe("missing executables", () => {
+  // Run the real backend entry point with a PATH that contains nothing, using
+  // bun's own absolute path, so this behaves identically on any machine or CI.
+  const entry = new URL("../backend/server-status.ts", import.meta.url).pathname;
+  const runWithoutPath = (...args: string[]) =>
+    Bun.spawnSync([process.execPath, "run", entry, ...args], {
+      env: { ...process.env, PATH: "/nonexistent-empty-path" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+  test("a missing tailscale CLI yields a clean snapshot, not a stack trace", () => {
+    const result = runWithoutPath("tailnet", "--compact");
+    const out = result.stdout.toString();
+    expect(result.exitCode).toBe(0);
+    const snapshot = JSON.parse(out);
+    expect(snapshot.backendState).toBe("Unavailable");
+    expect(snapshot.error).toContain("tailscale was not found on PATH");
+    expect(out + result.stderr.toString()).not.toContain("ENOENT");
+    expect(snapshot.error).not.toContain("/");
+  });
+
+  test("a missing ssh client yields a clean host error, not a stack trace", () => {
+    const result = runWithoutPath("status", "--host", "example-host", "--compact");
+    const out = result.stdout.toString();
+    expect(result.exitCode).toBe(0);
+    const snapshot = JSON.parse(out);
+    expect(snapshot.host).toBeNull();
+    expect(snapshot.error).toContain("ssh was not found on PATH");
+    expect(out + result.stderr.toString()).not.toContain("ENOENT");
+  });
+
+  test("spawnFailure never leaks a path for other start failures", async () => {
+    const { spawnFailure } = await import("../backend/collect");
+    expect(spawnFailure("ssh", { code: "ENOENT" }, "Install it")).toBe("ssh was not found on PATH. Install it.");
+    expect(spawnFailure("ssh", { code: "EACCES", message: "permission denied" }, "x"))
+      .toBe("Could not start ssh: permission denied");
+  });
+});

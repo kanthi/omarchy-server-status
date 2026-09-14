@@ -85,11 +85,30 @@ export function sshCommandForHost(sshHost: string): string[] {
   return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", sshHost];
 }
 
+/**
+ * Readable error for a child process that could not be started at all. A
+ * missing executable is the common case and gets an actionable message; the
+ * message never includes a path or a stack trace.
+ */
+export function spawnFailure(command: string, error: unknown, hint: string): string {
+  const code = (error as { code?: string } | null)?.code;
+  if (code === "ENOENT") return `${command} was not found on PATH. ${hint}.`;
+  const detail = String((error as { message?: string } | null)?.message || error)
+    .replace(/\s+/g, " ")
+    .slice(0, 160);
+  return `Could not start ${command}: ${detail}`;
+}
+
 export async function runSsh(sshHost: string): Promise<{ stdout: string; error: string }> {
-  const process = Bun.spawn(
-    [...sshCommandForHost(sshHost), REMOTE_SCRIPT],
-    { stdout: "pipe", stderr: "pipe", env: { ...Bun.env } },
-  );
+  let process: ReturnType<typeof Bun.spawn>;
+  try {
+    process = Bun.spawn(
+      [...sshCommandForHost(sshHost), REMOTE_SCRIPT],
+      { stdout: "pipe", stderr: "pipe", env: { ...Bun.env } },
+    );
+  } catch (error) {
+    return { stdout: "", error: spawnFailure("ssh", error, "Install an OpenSSH client to collect host metrics") };
+  }
 
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -98,8 +117,8 @@ export async function runSsh(sshHost: string): Promise<{ stdout: string; error: 
   }, SSH_TIMEOUT_MS);
 
   const [stdout, stderr, exitCode] = await Promise.all([
-    readBounded(process.stdout, MAX_SSH_STDOUT_BYTES, () => process.kill()),
-    readBounded(process.stderr, MAX_SSH_STDERR_BYTES, () => process.kill()),
+    readBounded(process.stdout as ReadableStream<Uint8Array>, MAX_SSH_STDOUT_BYTES, () => process.kill()),
+    readBounded(process.stderr as ReadableStream<Uint8Array>, MAX_SSH_STDERR_BYTES, () => process.kill()),
     process.exited,
   ]);
   clearTimeout(timer);

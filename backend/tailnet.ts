@@ -1,4 +1,4 @@
-import { readBounded } from "./collect";
+import { readBounded, spawnFailure } from "./collect";
 import type { TailnetDevice, TailnetSnapshot } from "./model";
 
 const TAILSCALE_TIMEOUT_MS = 10_000;
@@ -97,19 +97,34 @@ export function parseTailnetStatus(raw: string): TailnetSnapshot {
 }
 
 export async function collectTailnetSnapshot(): Promise<TailnetSnapshot> {
-  const process = Bun.spawn(["tailscale", "status", "--json"], {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: { ...Bun.env },
-  });
+  // Bun.spawn throws synchronously when the executable is missing. Uncaught,
+  // that crashed the backend and the panel printed Bun's raw stack trace, home
+  // paths included, as its error text: the first thing anyone saw if they
+  // installed the plugin before Tailscale.
+  let process: ReturnType<typeof Bun.spawn>;
+  try {
+    process = Bun.spawn(["tailscale", "status", "--json"], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...Bun.env },
+    });
+  } catch (error) {
+    return {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      backendState: "Unavailable",
+      devices: [],
+      error: spawnFailure("tailscale", error, "Install Tailscale to discover nodes"),
+    };
+  }
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
     process.kill();
   }, TAILSCALE_TIMEOUT_MS);
   const [stdout, stderr, exitCode] = await Promise.all([
-    readBounded(process.stdout, MAX_TAILSCALE_STDOUT_BYTES, () => process.kill()),
-    readBounded(process.stderr, MAX_TAILSCALE_STDERR_BYTES, () => process.kill()),
+    readBounded(process.stdout as ReadableStream<Uint8Array>, MAX_TAILSCALE_STDOUT_BYTES, () => process.kill()),
+    readBounded(process.stderr as ReadableStream<Uint8Array>, MAX_TAILSCALE_STDERR_BYTES, () => process.kill()),
     process.exited,
   ]);
   clearTimeout(timer);
