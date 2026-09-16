@@ -122,6 +122,12 @@ Panel {
   readonly property var snapshot: snapshotsByHost[activeHost] || ({ host: null, containers: [], error: "" })
   readonly property var hostInfo: snapshot.host || null
   readonly property var containers: snapshot.containers instanceof Array ? snapshot.containers : []
+  readonly property var appContainers: containers.filter(function(item) {
+    return String(item && item.runtime || "") !== "kvm"
+  })
+  readonly property var virtualMachines: containers.filter(function(item) {
+    return String(item && item.runtime || "") === "kvm"
+  })
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -801,18 +807,20 @@ Panel {
     return parts.join(" · ")
   }
 
-  function workloadHeader() {
-    var list = root.containers
-    var kvm = 0
-    var other = 0
-    for (var i = 0; i < list.length; i += 1) {
-      if (String(list[i] && list[i].runtime || "") === "kvm") kvm += 1
-      else other += 1
+  function vmDetail(vm) {
+    var parts = []
+    if (vm.memLimitBytes !== null && vm.memLimitBytes > 0) {
+      if (vm.state === "running" && vm.memUsageBytes !== null) {
+        parts.push("mem " + formatBytes(vm.memUsageBytes) + " (" + vm.memPercent.toFixed(0) + "%)")
+      } else {
+        parts.push("alloc " + formatBytes(vm.memLimitBytes))
+      }
     }
-    if (kvm > 0 && other > 0) return "CONTAINERS · " + other + " · VMS · " + kvm
-    if (kvm > 0) return "VMS · " + kvm
-    return "CONTAINERS · " + list.length
+    if (vm.status) parts.push(String(vm.status))
+    else parts.push(String(vm.state))
+    return parts.join(" · ")
   }
+
 
   function summaryFor(hostAlias) {
     if (isHostMuted(hostAlias)) return "pass"
@@ -1706,10 +1714,10 @@ Panel {
           Column {
             width: parent.width
             spacing: Style.space(8)
-            visible: !root.pickerOpen && root.activeDevice && root.containers.length > 0
+            visible: !root.pickerOpen && root.activeDevice && root.appContainers.length > 0
 
             PanelSectionHeader {
-              text: root.workloadHeader()
+              text: `CONTAINERS · ${root.appContainers.length}`
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -1718,15 +1726,44 @@ Panel {
               id: containerFlow
               width: parent.width
               spacing: Style.space(8)
-              readonly property int columns: root.containers.length > 20 ? 6 : (root.containers.length > 9 ? 4 : 3)
+              readonly property int columns: root.appContainers.length > 20 ? 6 : (root.appContainers.length > 9 ? 4 : 3)
 
               Repeater {
-                model: root.containers
+                model: root.appContainers
 
                 ContainerTile {
                   required property var modelData
                   width: (containerFlow.width - Style.space(8) * (containerFlow.columns - 1)) / containerFlow.columns
                   container: modelData
+                }
+              }
+            }
+          }
+
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: !root.pickerOpen && root.activeDevice && root.virtualMachines.length > 0
+
+            PanelSectionHeader {
+              text: `VIRTUAL MACHINES · ${root.virtualMachines.length}`
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Flow {
+              id: vmFlow
+              width: parent.width
+              spacing: Style.space(8)
+              readonly property int columns: root.virtualMachines.length > 20 ? 6 : (root.virtualMachines.length > 9 ? 4 : 3)
+
+              Repeater {
+                model: root.virtualMachines
+
+                VmTile {
+                  required property var modelData
+                  width: (vmFlow.width - Style.space(8) * (vmFlow.columns - 1)) / vmFlow.columns
+                  vm: modelData
                 }
               }
             }
@@ -2290,6 +2327,99 @@ Panel {
       enabled: containerTile.canToggleMute
       cursorShape: Qt.PointingHandCursor
       onClicked: root.toggleWarningMute(root.activeHost, containerTile.warningId)
+    }
+  }
+
+  component VmTile: Rectangle {
+    id: vmTile
+    required property var vm
+    readonly property string healthState: root.containerState(vm)
+    readonly property string warningId: root.containerWarningId(vm)
+    readonly property bool muted: root.isWarningMuted(root.activeHost, warningId)
+    readonly property bool canToggleMute: muted || healthState === "warn" || healthState === "fail"
+    readonly property string displayState: healthState
+    implicitHeight: Style.space(50)
+    radius: Style.cornerRadius
+    color: Util.alpha(root.foreground, 0.045)
+    border.width: canToggleMute ? 1 : 0
+    border.color: Util.alpha(root.stateColor(displayState), 0.55)
+
+    RowLayout {
+      anchors.fill: parent
+      anchors.margins: Style.space(8)
+      spacing: Style.space(7)
+
+      Rectangle {
+        Layout.preferredWidth: Style.space(10)
+        Layout.preferredHeight: Style.space(10)
+        radius: width / 2
+        color: root.stateColor(vmTile.displayState)
+      }
+
+      ColumnLayout {
+        Layout.fillWidth: true
+        spacing: Style.space(3)
+
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            text: root.displayContainerName(vmTile.vm)
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            elide: Text.ElideRight
+          }
+
+          Rectangle {
+            Layout.preferredHeight: Style.space(15)
+            Layout.preferredWidth: Style.space(32)
+            radius: Style.space(3)
+            color: Util.alpha(root.foreground, 0.08)
+
+            Text {
+              anchors.centerIn: parent
+              textFormat: Text.PlainText
+              text: "KVM"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+            }
+          }
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          Layout.fillWidth: true
+          text: root.vmDetail(vmTile.vm)
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        visible: vmTile.canToggleMute || vmTile.vm.memPercent !== null
+        text: vmTile.muted ? "MUTED" : (vmTile.canToggleMute ? "MUTE" : Math.round(vmTile.vm.memPercent) + "%")
+        color: root.stateColor(vmTile.displayState)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        font.bold: true
+      }
+    }
+
+    MouseArea {
+      anchors.fill: parent
+      enabled: vmTile.canToggleMute
+      cursorShape: Qt.PointingHandCursor
+      onClicked: root.toggleWarningMute(root.activeHost, vmTile.warningId)
     }
   }
 

@@ -482,6 +482,14 @@ describe("Panel.qml delayed callbacks", () => {
     expect(toggle).toContain("legacyWarningId(id)");
   });
 
+  test("separates containers and virtual machines into dedicated sections", () => {
+    expect(panel).toContain("readonly property var appContainers:");
+    expect(panel).toContain("readonly property var virtualMachines:");
+    expect(panel).toContain("CONTAINERS · ${root.appContainers.length}");
+    expect(panel).toContain("VIRTUAL MACHINES · ${root.virtualMachines.length}");
+    expect(panel).toContain("component VmTile:");
+  });
+
   test("contains no Hyprland workspace-switch launch path", () => {
     expect(panel).not.toContain("launchInNewWorkspace");
     expect(panel).not.toContain("workspaceProcess");
